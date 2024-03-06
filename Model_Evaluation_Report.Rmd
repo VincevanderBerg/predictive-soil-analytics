@@ -1,0 +1,666 @@
+---
+title: "Prediction of Titratable Acidity"
+author: "Vincent van der Berg"
+date: "24/10/2022"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction:
+
+This workbook covers a modelling workflow to identify and build the highest performing model to predict titratable acidity from commonly analysed soil attributes.
+
+
+This project was executed on behalf of Vivian White from Citrus Research International (CRI).
+
+
+The following packages were used throughout this analysis.
+
+
+```{r packages, results=FALSE}
+pacman::p_load(
+  tidyverse,
+  tidymodels,
+  GGally, # For additional visualisation ability
+  earth, # MARS model
+  glmnet, # Generalised linear model
+  rpart, # Decision tree model
+  ranger, # Random forest model
+  mixOmics,
+  tidytext,
+  skimr,
+  corrr,
+  ggforce
+)
+```
+
+
+### Data Import:
+
+
+```{r data_import}
+data <- readr::read_csv("data/tit_acid_full_raw")
+
+glimpse(data)
+
+data <- data %>%  
+  # Select and rename columns
+  dplyr::select(
+    sample,
+    texture, 
+    pH,
+    resistance,
+    stone = stone_v_v,
+    ambic_p = p_ambic_i,
+    K,
+    ec_Na:bs_Mg,
+    carbon = bs_C,
+    s_value,
+    EC,
+    r_eksteen:r_observed,
+    ta_eksteen = h_eksteen,
+    ta_true = H
+  )  
+# Check for correctness and missing values
+skim(data)
+```
+
+## Data Cleaning:
+
+Lots of missing values for texture, EC, and some for stone and ambic_p.
+
+```{r data_cleaning}
+data_clean <- data %>% 
+  # Drop sample 1117 - most vars are NA's #
+  filter(!(sample == 1117)) %>% 
+  # Drop EC and stone - too many NA's (834, 15) #
+  dplyr::select(-c(EC, stone)) %>% 
+  # Fill missing carbon and phosphorous value with column mean
+  mutate(carbon = replace(carbon, is.na(carbon), mean(carbon, na.rm = TRUE)),
+         ambic_p = replace(ambic_p, is.na(ambic_p), mean(ambic_p, na.rm = TRUE)),
+         # Fill missing texture values with "unknown"
+         texture = replace(texture, is.na(texture), "unknown"))
+
+# Check for correctness and missing values
+skim(data = data_clean)
+
+write_csv(data_clean, file = "./data/data_clean.csv")
+```
+
+
+### Train/Test Split:
+
+The target **ta_true** was normalised by taking its log.  This is done to ensure a normal distribution in the target, and to ensure positive predictions.  It also limits the effect of skewness on model error, thus resulting in better model fit during training.
+
+
+```{r train_test_split}
+## Load cleaned data set
+main_data <- read_csv(file = "./data/data_clean.csv")
+
+set.seed(42)
+soil_split <- main_data %>% 
+  dplyr::select(-c(texture, sample)) %>% 
+  mutate(ta_true = log10(ta_true)) %>% 
+  initial_split(strata = ta_true)
+  
+soil_split
+```
+
+
+```{r}
+soil_train <- training(soil_split)
+soil_test <- testing(soil_split)
+```
+
+
+## Exploratory Data Analysis:
+
+To explore the training set further, a correlation analysis, principal component analysis (PCA) and a partial least squares (PLS) analysis was performed.
+
+
+### Correlation:
+
+```{r corr_net_all}
+soil_train %>% 
+  correlate() %>% 
+  rearrange() %>% 
+  network_plot(colours = c("orange", "white", "midnightblue"),
+               min_cor = 0.5, legend = "range") + 
+  labs(title = "Correlation Network")
+```
+
+
+There is a significant direct negative correlation between variables **r_eksteen** and **pH** and the target **ta_true**.  This makes sense as both these variables are inextricably linked with soil acidity.  **carbon** and **ta_eksteen** also show to be sensibly positvely correlated with **ta_true**.
+
+There are numerous variables not associated with the target **ta_true**.  Variables associated with Na, K, and Mg show no direct correlation with **ta_true**.  This includes the **s_value** and **resistance** variables.  **ambic_p** further shows no significant correlation.
+
+Insignificantly correlated were removed, and the resulting data set was correlated again, to tease out finer relationships.
+
+```{r corr_net_signf}
+soil_train %>% 
+  dplyr::select(-c(resistance, ambic_p, ec_Na, bs_Na, bs_K, ec_K, K)) %>% 
+  correlate() %>% 
+  rearrange() %>% 
+  network_plot(colours = c("orange", "white", "midnightblue")) +
+  labs(title = "Correlation Network on Data-subset")
+```
+
+
+The variables with significant direct correlation to **ta_true** are **r_eksteen**, **pH**, **bs_Ca** and **r_observed** (*All negative*).  **carbon** and **ta_eksteen** show significant positive correlation.
+
+
+All these variables are however correlate with other variables that show no significant direct correlation with **ta_true**.  It can be concluded that these variables with significant correlation should be considered as candidates for modelling **ta_true**
+
+
+### Principal Component Analysis:
+
+PCA is one of the most straghtforward dimensionality reduction approaches.  It is a linear, unsupervised technique that makes new features to try and account for as much variation in the data as possible.
+
+```{r dim_red_rec}
+soil_rec <- recipe(ta_true ~ ., data = soil_train) %>% 
+  step_zv(all_numeric_predictors()) %>% 
+  step_normalize(all_numeric_predictors())
+
+rec_trained <- prep(soil_rec)
+rec_trained
+```
+
+
+```{r pca_pair_plt}
+rec_trained %>% 
+  step_pca(all_numeric_predictors(), num_comp = 4) %>% 
+  prep() %>% 
+  juice() %>% 
+  ggplot() +
+  geom_autopoint(aes(colour = ta_true), alpha = 0.4, size = 0.5) +
+  geom_autodensity(alpha = 0.3) +
+  facet_matrix(vars(-ta_true), layer.diag = 2) +
+  scale_color_distiller(palette = "BuPu", direction = 1) +
+  labs(colour = "Target (log)") +
+  ggtitle("Principal Component Analysis")
+```
+
+
+From the above it is clear that there is somewhat of a relationship between the components and the target variable.  There is a noticeable grouping and resulting gradient in the distribution of target values.  However, the relationships are not adequate enough to suggest that this data set is strictly linearly separable.
+
+These components was further investigated to find the features that contribute the most to these principal components.  Thus, variables that have the greatest linear contribution to the variance observed within the data set were identified.
+
+
+```{r pca_var_contr}
+rec_trained %>% 
+  step_pca(all_numeric_predictors(), num_comp = 4) %>% 
+  prep() %>% 
+  tidy(number = 3) %>% 
+  filter(component %in% paste0("PC", 1:4)) %>% 
+  group_by(component) %>% 
+  slice_max(abs(value), n = 5) %>% 
+  ungroup() %>% 
+  ggplot(mapping = aes(x = abs(value), y = terms, fill = value > 0)) +
+  geom_col(alpha = 0.8) +
+  facet_wrap(vars(component), scales = "free_y") +
+  labs(x = "Contribution to principal component",
+       y = NULL, fill = "Positive\ncontribution?",
+       title = "Top 5 Variance Contributing Variables")
+```
+
+
+PC1 is mostly about a soil's exchangeable cation component, particularly **s_value** and **ec_Ca**.  The contribution to observed variance by these components change in unison.  
+
+
+PC2 is mostly about acidity and soil reaction.  **r_eksteen**, **pH** and **bs_Ca** are strongly associated, in contrast to **ta_eksteen**.  Thus, this component suggests that as **ta_eksteen** increases, decreases in **r_eksteen** and **pH** are to be expected.
+
+
+PC3 and PC4 are mostly concerned with exchangeable cations, particularly **bs_Mg** and **bs_K**.  There are thus two groupings of soils that contribute to the variance of soils.  Soils with a high exchangeable cation component and a low soil acidity and reaction component.
+
+
+```{r}
+rec_trained %>% 
+  step_pca(all_numeric_predictors(), num_comp = 4) %>% 
+  prep() %>% 
+  juice() %>% 
+  ggplot(mapping = aes(x = PC1, y = PC2, colour = ta_true)) +
+  geom_point(alpha = 0.4,) +
+  scale_color_distiller(palette = "BuPu", direction = 1) +
+  labs(colour = "Target (log)",
+       title = "First Two Principal Compenent Value Distribution")
+```
+
+
+The diagram above illustrate the point stated previously.  Soils with high exchangeable cation content, low acidity and high pH are at the lower left of the data cloud.  Soils with lower exchangeable cation content, higher acidity, and lower pH are clustered towards the top and top-right of the data cloud.
+
+
+### Partial Least Squares Analysis:
+
+PLS is similar to PCA, but it is a supervised technique.  The technique creates components that aim to account for as much variation as possible, whilst being related to the outcome.
+
+
+```{r pls_recipe, results=FALSE}
+pls_rec <- recipe(ta_true ~ ., data = soil_train) %>% 
+  step_log(ta_true) %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+  step_pls(all_numeric_predictors(), outcome = "ta_true")
+
+pls_prep <- prep(pls_rec)
+```
+
+
+```{r}
+rec_trained %>% 
+  step_pls(all_numeric_predictors(), outcome = "ta_true", num_comp = 4) %>% 
+  prep() %>% 
+  juice() %>% 
+  ggplot() +
+  geom_autopoint(aes(colour = ta_true), alpha = 0.4, size = 0.5) +
+  geom_autodensity(alpha = 0.3) +
+  facet_matrix(vars(-ta_true), layer.diag = 2) +
+  scale_color_distiller(palette = "BuPu", direction = 1) +
+  labs(colour = "Target (log)") +
+  ggtitle("Partial Least Squares")
+```
+
+
+The diagram above illustrates the relationships between the components.  There is a stronger relationship present between the components and the target.  This is expected from the direct relation to **ta_true**.
+
+
+These components was further investigated to find the features that contribute the most to the components, similar to that of PCA.
+
+
+```{r}
+rec_trained %>% 
+  step_pls(all_numeric_predictors(), outcome = "ta_true", num_comp = 4) %>% 
+  prep() %>% 
+  tidy(number = 3) %>% 
+  filter(component %in% paste0("PLS", 1:4)) %>% 
+  group_by(component) %>% 
+  slice_max(abs(value), n = 5) %>% 
+  ungroup() %>% 
+  ggplot(mapping = aes(x = abs(value), y = terms, fill = value > 0)) +
+  geom_col(alpha = 0.8) +
+  facet_wrap(vars(component), scales = "free_y") +
+  labs(x = "Contribution to PLS component",
+       y = NULL, fill = "Positive\ncontribution?",
+       title = "Top 5 Variance Contributing Variables\nin Relation to Target")
+```
+
+
+The diagram above illustrates that **ta_eksteen**, **r_observed**, **r_eksteen**, **pH**, and **carbon** most significantly contribute to the first couple of components.
+
+
+### EDA Conclusion
+
+It can be concluded from this exploration that only six variables are required to effectively model titratable acidity.  These variables include **ta_eksteen**, **r_observed**, **r_eksteen**, **pH**, **carbon**.  Components related to calcium are also of interest.  The selected variables will serve as the main parameters for model development.
+
+Both **ec_Ca** and **bs_Ca** showed relationships to **ta_true**.  However, since the value of **bs_Ca** relies on acidity itself, its interaction could be misleading.  Going forward then, **ec_Ca** was included in the six variables used for modelling of the current data set.
+
+
+## Modelling Workflow
+
+
+### Model evaluation
+
+Four models was selected for evaluation.  They include a penalised general linear model, multi-adaptive regression splines, decision trees and an ensemble of trees, the random forest.  
+
+
+The linear model was included as reference model, whilst the other three are strictly non-linear.  The reliance on non-linear models is due to the poor linear separability of the data set.
+
+
+The models were also selected due to their ease of use and their robustness to predictor skewness.  Thus, pre-processing of the data, such as transformation, normalisation, feature scaling, etc is not required.
+
+
+```{r }
+train_data <- soil_train %>% 
+  dplyr::select(pH, carbon, r_eksteen, r_observed, ta_eksteen, ec_Ca, ta_true)
+
+test_data <- soil_test %>% 
+  dplyr::select(pH, carbon, r_eksteen, r_observed, ta_eksteen, ec_Ca, ta_true)
+
+train_data %>% 
+  GGally::ggpairs(progress = FALSE) +
+  labs(title = "Target Variable Pairplot")
+```
+
+
+This study evaluated model performance during training by implementing repeated K-fold cross-validation.  Training data was split into 15 folds.  Models were trained on 14 folds and evaluated on the holdout fold.  There were thus 15 unique iterations of the holdout fold.  This entire process repeated 3 times.
+
+
+The approach described above allows for a detailed assessment of model performance.  The allows for the generation of performance values such as rmse or mae with statistical properties.  The statistical properties of interest are the mean (n = 45) and standard error of the mean, and was focussed on during this evaluation.
+
+
+Each of the models' hyper-parameters were tuned during training to find the most optimal combination.  To achieve this, grid search was employed on a grid of 10 iterations of each hyper-parameter.  Thus, for the penalised GLM, a 10 x 10 hyper-parameter grid was searched for the combination of parameters that yielded the best performing model.  To avoid overfitting and reduce training time, the random forest was allowed to only utilise 750 trees.
+
+
+```{r}
+## Create validation folds
+cv_folds <- vfold_cv(data = train_data,
+                     strata = ta_true,
+                     repeats = 3,
+                     v = 15)
+
+## Create recipes for modelling
+normal_rec <- recipe(ta_true ~ pH + carbon + r_eksteen + r_observed + ta_eksteen + ec_Ca, data = train_data)
+
+## Recipe with interactions
+interact_rec <- normal_rec %>% 
+  step_interact(~ all_predictors():all_predictors()) %>% 
+  step_corr(threshold = 0.75) # Remove highly correlated variables
+
+## Specify models
+# Penalised GLM
+linear_model <- linear_reg(penalty = tune(),
+                           mixture = tune()) %>% 
+  set_engine("glmnet") %>% 
+  set_mode("regression")
+# MARS model
+mars_model <- mars(prod_degree = tune()) %>% 
+  set_engine("earth") %>% 
+  set_mode("regression")
+# Decision tree
+cart_model <- decision_tree(cost_complexity = tune(),
+                            min_n = tune()) %>% 
+  set_engine("rpart") %>% 
+  set_mode("regression")
+# Random forest
+rf_model <- rand_forest(mtry = tune(),
+                        min_n = tune(),
+                        trees = 750) %>% 
+  set_engine("ranger") %>% 
+  set_mode("regression")
+
+## Compile recipes and model specifications into workflow
+all_workflows <- workflow_set(
+  preproc = list(normal = normal_rec,
+                 interactions = interact_rec),
+  models = list(linear = linear_model, mars = mars_model,
+                cart = cart_model, forest = rf_model)
+)
+
+## Specify control grid
+grid_ctrl <- control_grid(
+  save_pred = TRUE,
+  parallel_over = "everything"
+)
+```
+
+
+### Evaluation results
+
+
+```{r}
+## Collect evaluation results
+grid_results <- all_workflows %>% 
+  workflow_map(
+    fn = "tune_grid",
+    seed = 42,
+    resamples = cv_folds,
+    grid = 10,
+    control = grid_ctrl,
+    metrics = metric_set(rmse, mae, rsq),
+    verbose = TRUE
+  )
+
+## Plot results
+autoplot(grid_results,
+         metric = c("rsq", "rmse", "mae"),
+         select_best = TRUE) +
+  ggtitle("Model Training Results\n15-Fold Cross Validation\n3 Repeats")
+```
+
+```{r}
+training_metrics <- grid_results %>% 
+  rank_results(select_best = TRUE) %>% 
+  dplyr::select(
+    Model = wflow_id,
+    Metric = .metric,
+    Mean = mean,
+    Std_err = std_err,
+    n,
+    Rank = rank
+  ) %>%
+  mutate(Mean = round(Mean, 4),
+         Std_err = round(Std_err, 4))
+
+# write_csv(training_metrics, file = "./ouputs/model_training_metrics.csv")
+
+training_metrics
+```
+
+
+The top three performing workflows were the MARS and random forest models with interaction features.  The random forest without interaction components came in third, yet nevertheless performed adequately.
+
+
+Below are each of the top three performing model's hyperparameter settings.
+
+```{r}
+grid_results %>% 
+  extract_workflow_set_result(id = "interactions_mars") %>% 
+  select_best(metric = "mae")
+```
+
+
+```{r}
+grid_results %>% 
+  extract_workflow_set_result(id = "interactions_forest") %>% 
+  select_best(metric = "mae")
+```
+
+
+```{r}
+grid_results %>% 
+  extract_workflow_set_result(id = "normal_forest") %>% 
+  select_best(metric = "mae")
+```
+
+
+### Train Best Models
+
+Below each of the models were trained with the hyper parameter settings found to be optimal during model evaluation (table above).
+
+
+```{r}
+mars_spec <- mars(prod_degree = 1) %>% 
+  set_engine("earth") %>% 
+  set_mode("regression")
+
+mars_wflow <- workflow() %>% 
+  add_recipe(interact_rec) %>% 
+  add_model(mars_spec)
+
+rf_spec <- rand_forest(mtry = 13,
+                       min_n = 8,
+                       trees = 750) %>% 
+  set_engine("ranger") %>% 
+  set_mode("regression")
+
+rf_wflow <- workflow() %>% 
+  add_recipe(interact_rec) %>% 
+  add_model(rf_spec)
+```
+
+
+Models were trained on all training set data, and then fit on the test data.  The results from training and testing were collected to evaluate model performance and identify if over fitting occurred.
+
+
+```{r}
+mars_fit <- fit(mars_wflow, data = soil_train)
+rf_fit <- fit(rf_wflow, data = soil_train)
+```
+
+
+```{r}
+results_train <- mars_fit %>% 
+  predict(new_data = soil_train) %>% 
+  mutate(truth = soil_train$ta_true,
+         model = "MARS") %>% 
+  bind_rows(rf_fit %>% 
+    predict(new_data = soil_train) %>% 
+    mutate(truth = soil_train$ta_true,
+           model = "RF"))
+
+results_test <- mars_fit %>% 
+  predict(new_data = soil_test) %>% 
+  mutate(truth = soil_test$ta_true,
+         model = "MARS") %>% 
+  bind_rows(rf_fit %>% 
+    predict(new_data = soil_test) %>% 
+    mutate(truth = soil_test$ta_true,
+           model = "RF"))
+```
+
+
+```{r}
+results_train %>% 
+  group_by(model) %>% 
+  rmse(truth = 10^truth, estimate = 10^.pred) %>% 
+  bind_rows(
+    results_train %>% 
+      group_by(model) %>% 
+      mae(truth = 10^truth, estimate = 10^.pred)
+  ) %>% 
+  bind_rows(
+    results_train %>% 
+      group_by(model) %>% 
+      rsq(truth = 10^truth, estimate = 10^.pred)
+  )
+```
+
+
+The models performed similarly during training, with the MARS model marginally outperforming the random forest model.  The R^2 value is noticeably high for both models.
+
+### Expected model performance
+
+The values below identify model performance on unseen data.  These values are to be reported as an estimate of each model's true expected performance.  This allows us to make an estimate of each models ability to generalise to new, unseen data.
+
+
+```{r}
+results_test %>% 
+  group_by(model) %>% 
+  rmse(truth = 10^truth, estimate = 10^.pred) %>% 
+  bind_rows(
+    results_test %>% 
+      group_by(model) %>% 
+      mae(truth = 10^truth, estimate = 10^.pred)
+  ) %>% 
+  bind_rows(
+    results_test %>% 
+      group_by(model) %>% 
+      rsq(truth = 10^truth, estimate = 10^.pred)
+  )
+```
+
+
+The values in the table above are to be the reported values for final model performance.  It is clear from these results that the random forest slightly over fitted on the training set.  
+
+
+Were a model to be developed with perhaps a smaller number of trees in the ensemble, generalisation is expected to improve.  It could also lead to a model that trains faster, due to the decrease in model complexity.
+
+
+```{r}
+results_test %>% 
+  mutate(train = "testing",
+         .pred = 10^.pred,
+         truth = 10^truth) %>% 
+  bind_rows(results_train %>% 
+    mutate(train = "training",
+           .pred = 10^.pred,
+           truth = 10^truth)) %>% 
+  ggplot(mapping = aes(x = truth, y = .pred, colour = model)) +
+  geom_abline(lty = 2, colour = "gray80", size = 1.5) +
+  geom_point(alpha = 0.5) +
+  facet_wrap(model ~ train) +
+  labs(
+    x = "Truth",
+    y = "Predicted TA",
+    colour = "Type of Model",
+    title = "Overall Model Performance"
+  )
+```
+
+
+From the graph above both models start becoming erratic in their predictions at high titratable acidity values.  This was attributed to a lower number of values present in that titratable acidity range.
+
+
+Nevertheless, the MARS model performed much better in those sparse regions and showed acceptable generalisation capacity.
+
+
+## Conclusion
+
+
+The MARS model with a highest possible interaction degree of one has shown to be the best fitting model for this data set.  Exploratory analysis found that only 6 variables have the highest predictive ability, and include **ta_eksteen**, **r_observed**, **r_eksteen**, **pH**, **carbon** and **ec_Ca**.  Creating interaction terms between these variables and removing terms with correlations greater than 0.75 proved to be a sufficient preprocessing technique.  The model performed well on the testing set, showing very little sign of over fitting.
+
+
+The random forest model performed well during training, however fared considerably poorly on the test set.  It is clear that the random forest model over fit to the training data.  It is thus recommended that the total number of trees relied upon in the ensemble be lessened to avoid over fitting.  It should be noted that the MARS model be used for predictive purposes due to its ability to be fit quickly, its simplicity and robustness to noise in this data set.
+
+Below, the MARS model is trained on all data and predicted values are appended to the complete data set, to be used for deeper analysis.
+
+
+```{r}
+# Define data preprocessing recipe
+final_build_data <- main_data %>% 
+  mutate(ta_true_log = log10(ta_true))
+
+main_rec <- recipe(ta_true_log ~ ta_eksteen + r_observed + r_eksteen +
+                   pH + carbon + bs_Ca, data = final_build_data) %>% 
+  step_interact(~ all_numeric_predictors():all_numeric_predictors()) %>% 
+  step_corr(threshold = 0.75)
+# Define model
+target_model <- mars(prod_degree = 1) %>% 
+  set_engine("earth") %>% 
+  set_mode("regression")
+
+model_wflow <- workflow() %>% 
+  add_recipe(main_rec) %>% 
+  add_model(target_model)
+
+model_fit <- fit(model_wflow, data = final_build_data)
+```
+
+
+```{r}
+final_data <- augment(model_fit, new_data = final_build_data) %>% 
+  mutate(.pred = 10^(.pred))
+
+final_data %>% 
+  ggplot(mapping = aes(x = ta_true, y = .pred, colour = pH)) +
+  geom_point() +
+  geom_abline(lty = 2, colour = "gray80", size = 1.5) +
+  labs(title = "Actual vs. Predicted TA",
+       x = "Actual", y = "Prediction")
+
+# write_csv(final_data, file = "./data/final_data.csv")
+```
+
+
+## Final model results
+
+
+```{r}
+final_data %>% 
+  rsq(truth = ta_true, estimate = .pred) %>% 
+  bind_rows(
+    final_data %>% 
+      rmse(truth = ta_true, estimate = .pred)) %>%
+      bind_rows(
+        final_data %>% 
+          mae(truth = ta_true, estimate = .pred))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
